@@ -9,6 +9,7 @@ for the MTP head parameters only.
 import argparse
 import json
 import math
+import re
 import time
 from pathlib import Path
 
@@ -16,7 +17,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 import numpy as np
-from mlx.utils import tree_flatten, tree_map
+from mlx.utils import tree_flatten, tree_map, tree_unflatten
 from mlx_lm.utils import load
 
 
@@ -51,21 +52,27 @@ def batch_iter(dataset, batch_size: int):
             batch = []
 
 
+class MTPBlock(nn.Module):
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        self.norm = nn.RMSNorm(hidden_size)
+        self.up = nn.Linear(hidden_size, hidden_size)
+        self.down = nn.Linear(hidden_size, hidden_size)
+
+    def __call__(self, x):
+        return self.down(nn.silu(self.up(self.norm(x))))
+
+
 class MTPHead(nn.Module):
     def __init__(self, hidden_size: int, depth: int):
         super().__init__()
-        self.blocks = [
-            nn.Sequential(
-                nn.RMSNorm(hidden_size),
-                nn.Linear(hidden_size, hidden_size),
-                nn.SiLU(),
-                nn.Linear(hidden_size, hidden_size),
-            )
-            for _ in range(depth)
-        ]
+        self.blocks = {
+            f"block_{i}": MTPBlock(hidden_size)
+            for i in range(depth)
+        }
 
     def __call__(self, hidden_states):
-        return [block(hidden_states) for block in self.blocks]
+        return [block(hidden_states) for block in self.blocks.values()]
 
 
 def lm_project(model, hidden_states):
@@ -100,6 +107,72 @@ def mtp_loss(head, hidden, input_ids, lengths, base_model, depth: int):
     return total / valid_losses
 
 
+def prefixed_flatten(prefix, tree):
+    return {f"{prefix}.{k}": v for k, v in tree_flatten(tree)}
+
+
+def strip_prefix(weights, prefix):
+    prefix = f"{prefix}."
+    return [
+        (k[len(prefix):], v)
+        for k, v in weights.items()
+        if k.startswith(prefix)
+    ]
+
+
+def checkpoint_path(checkpoint_dir: Path, step: int):
+    return checkpoint_dir / f"step_{step:07d}.safetensors"
+
+
+def find_latest_checkpoint(checkpoint_dir: Path):
+    checkpoints = sorted(checkpoint_dir.glob("step_*.safetensors"))
+    return checkpoints[-1] if checkpoints else None
+
+
+def checkpoint_step(path: Path):
+    match = re.search(r"step_(\d+)\.safetensors$", path.name)
+    if not match:
+        raise ValueError(f"Cannot infer checkpoint step from {path}")
+    return int(match.group(1))
+
+
+def optimizer_state_for_save(args, optimizer):
+    if args.optimizer == "muon":
+        state = {}
+        state.update(prefixed_flatten("optimizer.muon", optimizer["muon"].state))
+        state.update(prefixed_flatten("optimizer.adamw", optimizer["adamw"].state))
+        return state
+    return prefixed_flatten("optimizer", optimizer.state)
+
+
+def restore_optimizer_state(args, optimizer, weights):
+    if args.optimizer == "muon":
+        optimizer["muon"].state = tree_unflatten(strip_prefix(weights, "optimizer.muon"))
+        optimizer["adamw"].state = tree_unflatten(strip_prefix(weights, "optimizer.adamw"))
+    else:
+        optimizer.state = tree_unflatten(strip_prefix(weights, "optimizer"))
+
+
+def save_checkpoint(path: Path, head, args, optimizer, step: int, micro_step: int):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    state = {}
+    state.update(prefixed_flatten("head", head.trainable_parameters()))
+    state.update(optimizer_state_for_save(args, optimizer))
+    mx.save_safetensors(str(path), state)
+    meta = {
+        "step": step,
+        "micro_step": micro_step,
+        "optimizer": args.optimizer,
+        "head_dtype": args.head_dtype,
+        "mtp_depth": args.mtp_depth,
+        "max_length": args.max_length,
+        "batch_size": args.batch_size,
+        "grad_accum": args.grad_accum,
+        "lr": args.lr,
+    }
+    path.with_suffix(".json").write_text(json.dumps(meta, indent=2) + "\n")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
@@ -111,9 +184,12 @@ def main():
     parser.add_argument("--grad-accum", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--head-dtype", choices=("float32", "bfloat16", "float16"), default="bfloat16")
+    parser.add_argument("--optimizer", choices=("adamw", "muon"), default="adamw")
     parser.add_argument("--max-steps", type=int, default=1000)
     parser.add_argument("--steps-per-report", type=int, default=10)
     parser.add_argument("--steps-per-save", type=int, default=100)
+    parser.add_argument("--checkpoint-dir", type=Path)
+    parser.add_argument("--resume", nargs="?", const="latest")
     args = parser.parse_args()
 
     if mx.metal.is_available():
@@ -133,20 +209,49 @@ def main():
     }[args.head_dtype]
     head.set_dtype(head_dtype)
 
-    # Use Muon for 2D weights (Linear layers) and AdamW for 1D (RMSNorm, biases)
-    muon = optim.Muon(learning_rate=args.lr)
-    adamw = optim.AdamW(learning_rate=args.lr)
-
-    def select_optimizer(path, value):
-        return muon if value.ndim == 2 else adamw
-
-    optimizer = optim.MultiOptimizer(select_optimizer)
+    if args.optimizer == "muon":
+        # Muon is intended for matrix weights. Use AdamW for norm weights/biases.
+        optimizer = {
+            "muon": optim.Muon(learning_rate=args.lr),
+            "adamw": optim.AdamW(learning_rate=args.lr),
+        }
+    else:
+        optimizer = optim.AdamW(learning_rate=args.lr)
     loss_and_grad = nn.value_and_grad(head, mtp_loss)
 
     dataset = JsonlTokenDataset(args.data, args.max_length)
     batches = batch_iter(iter(dataset), args.batch_size)
 
+    if args.output.suffix != ".safetensors":
+        args.output = args.output / "qwen35_2b_mtp_head_mlx.safetensors"
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir = args.checkpoint_dir or (args.output.parent / "checkpoints")
+
+    start_step = 0
+    start_micro_step = 0
+    if args.resume:
+        resume_path = (
+            find_latest_checkpoint(checkpoint_dir)
+            if args.resume == "latest"
+            else Path(args.resume)
+        )
+        if resume_path is None:
+            print(f"No checkpoint found in {checkpoint_dir}; starting fresh", flush=True)
+        else:
+            weights = mx.load(str(resume_path))
+            head.update(tree_unflatten(strip_prefix(weights, "head")))
+            restore_optimizer_state(args, optimizer, weights)
+            start_step = checkpoint_step(resume_path)
+            start_micro_step = start_step * args.grad_accum
+            print(
+                f"Resumed checkpoint {resume_path} at step {start_step}; "
+                f"skipping {start_micro_step} micro-batches",
+                flush=True,
+            )
+            mx.eval(head.parameters())
+            for _ in range(start_micro_step):
+                next(batches)
+
     print(
         f"Starting MLX MTP training: max_steps={args.max_steps}, "
         f"max_length={args.max_length}, grad_accum={args.grad_accum}",
@@ -158,7 +263,7 @@ def main():
     accum_count = 0
     tic = time.perf_counter()
 
-    for micro_step, (input_ids, lengths) in enumerate(batches, start=1):
+    for micro_step, (input_ids, lengths) in enumerate(batches, start=start_micro_step + 1):
         hidden = model.language_model.model(input_ids)
         hidden = hidden.astype(head_dtype)
         mx.eval(hidden)
@@ -183,8 +288,40 @@ def main():
         if micro_step % args.grad_accum == 0:
             step = micro_step // args.grad_accum
             scaled_grads = tree_map(lambda x: x / args.grad_accum, accum_grads)
-            optimizer.update(head, scaled_grads)
-            mx.eval(head.parameters(), optimizer.state)
+            if args.optimizer == "muon":
+                flat_params = dict(tree_flatten(head.trainable_parameters()))
+                flat_grads = dict(tree_flatten(scaled_grads))
+                muon_params = {
+                    k: v for k, v in flat_params.items()
+                    if flat_grads[k].ndim == 2
+                }
+                muon_grads = {k: flat_grads[k] for k in muon_params}
+                adamw_params = {
+                    k: v for k, v in flat_params.items()
+                    if k not in muon_params
+                }
+                adamw_grads = {k: flat_grads[k] for k in adamw_params}
+                updated = {}
+                updated.update(
+                    optimizer["muon"].apply_gradients(muon_grads, muon_params)
+                )
+                updated.update(
+                    optimizer["adamw"].apply_gradients(adamw_grads, adamw_params)
+                )
+                head.update(tree_unflatten(list(updated.items())))
+                mx.eval(
+                    head.parameters(),
+                    optimizer["muon"].state,
+                    optimizer["adamw"].state,
+                )
+            else:
+                head.update(
+                    optimizer.apply_gradients(
+                        scaled_grads,
+                        head.trainable_parameters(),
+                    )
+                )
+                mx.eval(head.parameters(), optimizer.state)
             mx.clear_cache()
             accum_grads = None
 
@@ -204,6 +341,14 @@ def main():
                     for k, v in tree_flatten(head.trainable_parameters())
                 }
                 mx.save_safetensors(str(args.output), state)
+                save_checkpoint(
+                    checkpoint_path(checkpoint_dir, step),
+                    head,
+                    args,
+                    optimizer,
+                    step,
+                    micro_step,
+                )
                 print(f"Step {step}: saved {args.output}", flush=True)
 
             if step >= args.max_steps:
