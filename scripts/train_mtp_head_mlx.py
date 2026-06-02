@@ -53,21 +53,25 @@ def batch_iter(dataset, batch_size: int):
 
 
 class MTPBlock(nn.Module):
-    def __init__(self, hidden_size: int):
+    def __init__(self, hidden_size: int, expansion: int):
         super().__init__()
+        inner_size = hidden_size * expansion
         self.norm = nn.RMSNorm(hidden_size)
-        self.up = nn.Linear(hidden_size, hidden_size)
-        self.down = nn.Linear(hidden_size, hidden_size)
+        self.gate = nn.Linear(hidden_size, inner_size)
+        self.up = nn.Linear(hidden_size, inner_size)
+        self.down = nn.Linear(inner_size, hidden_size)
 
     def __call__(self, x):
-        return self.down(nn.silu(self.up(self.norm(x))))
+        h = self.norm(x)
+        y = nn.silu(self.gate(h)) * self.up(h)
+        return x + self.down(y)
 
 
 class MTPHead(nn.Module):
-    def __init__(self, hidden_size: int, depth: int):
+    def __init__(self, hidden_size: int, depth: int, expansion: int):
         super().__init__()
         self.blocks = {
-            f"block_{i}": MTPBlock(hidden_size)
+            f"block_{i}": MTPBlock(hidden_size, expansion)
             for i in range(depth)
         }
 
@@ -165,6 +169,7 @@ def save_checkpoint(path: Path, head, args, optimizer, step: int, micro_step: in
         "optimizer": args.optimizer,
         "head_dtype": args.head_dtype,
         "mtp_depth": args.mtp_depth,
+        "mtp_expansion": args.mtp_expansion,
         "max_length": args.max_length,
         "batch_size": args.batch_size,
         "grad_accum": args.grad_accum,
@@ -182,6 +187,7 @@ def main():
     parser.add_argument("--max-length", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--grad-accum", type=int, default=16)
+    parser.add_argument("--mtp-expansion", type=int, default=2)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--head-dtype", choices=("float32", "bfloat16", "float16"), default="bfloat16")
     parser.add_argument("--optimizer", choices=("adamw", "muon"), default="adamw")
@@ -201,7 +207,7 @@ def main():
     model.freeze()
     hidden_size = model.args.text_config["hidden_size"]
 
-    head = MTPHead(hidden_size, args.mtp_depth)
+    head = MTPHead(hidden_size, args.mtp_depth, args.mtp_expansion)
     head_dtype = {
         "float32": mx.float32,
         "bfloat16": mx.bfloat16,
